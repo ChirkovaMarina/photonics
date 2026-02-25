@@ -1,0 +1,291 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# Math helpers
+# ---------------------------
+def k0(lmbd):
+    return 2*np.pi / lmbd
+
+def kx(beta, lmbd, n_core):
+    val = (n_core * k0(lmbd))**2 - beta**2
+    return np.sqrt(np.maximum(val, 0.0))
+
+def gamma(beta, lmbd, n_clad):
+    val = beta**2 - (n_clad * k0(lmbd))**2
+    return np.sqrt(np.maximum(val, 0.0))
+
+
+def F_TE_even(beta, m, lmbd, n_core, n_clad, h):
+    a = h/2
+    kx_val = kx(beta, lmbd, n_core)
+    g_val  = gamma(beta, lmbd, n_clad)
+    if kx_val<=0:
+        return np.nan
+    return kx_val * a - np.arctan(g_val/ kx_val) - m * np.pi 
+
+def F_TE_odd(beta, m, lmbd, n_core, n_clad, h):
+    a = h/2
+    kx_val = kx(beta, lmbd, n_core)
+    g_val  = gamma(beta, lmbd, n_clad)
+    if kx_val<=0:
+        return np.nan
+    return kx_val * a - np.pi/2 + np.arctan(kx_val / g_val) - m * np.pi
+
+def bisect_root(func, a, b, tol=1e-12, max_iter=200):
+    fa = func(a)
+    fb = func(b)
+    if not np.isfinite(fa) or not np.isfinite(fb):
+        raise ValueError("Non-finite function values in bisection bracket.")
+    if fa * fb > 0:
+        raise ValueError("Bisection bracket does not straddle a root.")
+    for _ in range(max_iter):
+        c = 0.5*(a+b)
+        fc = func(c)
+        if not np.isfinite(fc):
+            # немного сдвинемся
+            c = np.nextafter(c, b)
+            fc = func(c)
+        if abs(fc) < tol or 0.5*(b-a) < tol:
+            return c
+        if fa * fc <= 0:
+            b, fb = c, fc
+        else:
+            a, fa = c, fc
+    return 0.5*(a+b)
+
+# ---------------------------
+# Mode solver
+# ---------------------------
+def solve_modes_TE(lmbd, n_core, n_clad, h, eps=1e-12, m_max=10, Nscan=4000):
+    """
+    Returns list of modes, each mode is dict:
+      {"m": m, "beta": beta, "neff": neff}
+    """
+    k0_val = k0(lmbd)
+    beta_min = n_clad*k0_val + eps
+    beta_max = n_core*k0_val - eps
+
+    modes = []
+
+    beta_grid = np.linspace(beta_min, beta_max, Nscan)
+    q_max = m_max //2  
+    for q in range(q_max+1):
+        for parity, func in [
+            ("even", lambda b, q=q: F_TE_even(b, q, lmbd, n_core, n_clad, h)),
+            ("odd",  lambda b, q=q: F_TE_odd(b, q, lmbd, n_core, n_clad, h))
+        ]:
+            f_vals = np.array([func(b) for b in beta_grid])
+
+            brackets = []
+            for i in range(1, len(beta_grid)):
+                if (np.isfinite(f_vals[i-1])) and np.isfinite(f_vals[i]) and f_vals[i-1] * f_vals[i]<0:
+                    brackets.append((beta_grid[i-1], beta_grid[i]))
+                
+            for b1, b2 in brackets:
+                try:
+                    beta_root = bisect_root(func, b1, b2)
+                except ValueError:
+                    continue
+                neff = beta_root / k0_val
+                m_index = q*2 if parity=="even" else q*2+1
+                modes.append({"m": m_index, "parity": parity, "beta": beta_root, "neff": neff})
+
+    # убираем дубликаты (если два bracket дали один и тот же корень)
+    modes = _deduplicate_modes(modes, tol=1e-8)
+
+    # сортируем по убыванию neff и перенумеровываем
+    modes.sort(key=lambda md: -md["neff"])
+    for i, md in enumerate(modes):
+        md["m"] = i
+
+
+    return modes
+
+def _deduplicate_modes(modes, tol=1e-8):
+    unique = []
+    for md in modes:
+        if not any(abs(md["beta"] - u["beta"]) < tol for u in unique):
+            unique.append(md)
+    return unique
+
+# ---------------------------
+# Field profile (simple normalized Ey)
+# ---------------------------
+def build_field_profile(mode, lmbd, n_core, n_clad, h, x_grid):
+    beta = mode["beta"]
+
+    kx_val = kx(beta, lmbd, n_core)
+    g_val  = gamma(beta, lmbd, n_clad)
+
+    a = h/2.0
+    x = x_grid
+
+    field = np.zeros_like(x, dtype=float)
+
+    core_mask = np.abs(x) <= a
+    clad_mask = ~core_mask
+
+    # parity choice: even for even m, odd for odd m (для этой унифицированной нумерации обычно так удобно)
+    if mode["parity"] == "even":
+        field[core_mask] = np.cos(kx_val * x[core_mask])
+        E_boundary = np.cos(kx_val * a)
+        field[clad_mask] = E_boundary * np.exp(-g_val * (np.abs(x[clad_mask]) - a))
+    else:
+        field[core_mask] = np.sin(kx_val * x[core_mask])
+        E_boundary = np.sin(kx_val * a)
+        field[clad_mask] = np.sin(kx_val * a) * np.sign(x[clad_mask]) * np.exp(-g_val * (np.abs(x[clad_mask]) - a))
+    
+
+    # normalize by integral |E|^2 dx
+    norm = np.sqrt(np.trapezoid(field**2, x))
+    if norm > 0:
+        field /= norm
+
+    return field
+
+# ---------------------------
+# Sweep + ng
+# ---------------------------
+def sweep_lambda_TE(n_core, n_clad, h, lambda_list, Xmax=3.0, Nx=2001, eps=1e-12, m_max=6):
+    lambda_list = np.asarray(lambda_list, float)
+    x_grid = np.linspace(-Xmax, +Xmax, Nx)
+
+    results = {}
+    for lam in lambda_list:
+        modes = solve_modes_TE(lam, n_core, n_clad, h, eps=eps, m_max=m_max)
+        results[lam] = []
+        for mode in modes:
+            field = build_field_profile(mode, lam, n_core, n_clad, h, x_grid)
+            results[lam].append({
+                "m":      mode["m"],
+                "parity": mode["parity"],  # <-- нужно для build_field_profile если вызывать повторно
+                "beta":   mode["beta"],
+                "neff":   mode["neff"],
+                "x":      x_grid,
+                "field":  field,
+            })
+
+    # collect neff branches
+    all_ms = sorted({md["m"] for lam in lambda_list for md in results[lam]})
+    neff_branches = {m: np.full(len(lambda_list), np.nan) for m in all_ms}
+
+    for i, lam in enumerate(lambda_list):
+        for md in results[lam]:
+            neff_branches[md["m"]][i] = md["neff"]
+
+    # compute ng and attach back
+    for m, neff_vs_lam in neff_branches.items():
+        valid = np.isfinite(neff_vs_lam)
+        if valid.sum() < 3:
+            continue
+        lam_v  = lambda_list[valid]
+        neff_v = neff_vs_lam[valid]
+        dneff_dlam = np.gradient(neff_v, lam_v)
+        ng_v = neff_v - lam_v * dneff_dlam
+
+        # map back
+        j = 0
+        for i, lam in enumerate(lambda_list):
+            if not valid[i]:
+                continue
+            for md in results[lam]:
+                if md["m"] == m:
+                    md["ng"] = float(ng_v[j])
+                    break
+            j += 1
+
+    return results
+
+# ---------------------------
+# Plotting + utilities
+# ---------------------------
+def nearest_lambda(lambda_list, target):
+    lambda_list = np.asarray(lambda_list, float)
+    return float(lambda_list[np.argmin(np.abs(lambda_list - target))])
+
+def extract_branches(results, lambda_list):
+    lambda_list = np.asarray(lambda_list, float)
+    all_ms = sorted({md["m"] for lam in lambda_list for md in results[lam]})
+    branches = {m: {"lambda": lambda_list.copy(),
+                    "neff": np.full(len(lambda_list), np.nan),
+                    "ng":   np.full(len(lambda_list), np.nan)} for m in all_ms}
+
+    for i, lam in enumerate(lambda_list):
+        for md in results[lam]:
+            m = md["m"]
+            branches[m]["neff"][i] = md.get("neff", np.nan)
+            branches[m]["ng"][i]   = md.get("ng", np.nan)
+    return branches
+
+def plot_neff_ng(branches):
+    plt.figure()
+    for m, b in branches.items():
+        plt.plot(b["lambda"], b["neff"], label=f"TE m={m}")
+    plt.xlabel("Wavelength")
+    plt.ylabel("n_eff")
+    plt.grid(True)
+    plt.legend()
+    plt.title("n_eff(λ)")
+    plt.show()
+
+    plt.figure()
+    for m, b in branches.items():
+        plt.plot(b["lambda"], b["ng"], label=f"TE m={m}")
+    plt.xlabel("Wavelength")
+    plt.ylabel("n_g")
+    plt.grid(True)
+    plt.legend()
+    plt.title("n_g(λ)")
+    plt.show()
+
+def plot_field_at_lambda(results, lambda0, m=0):
+    md = next((x for x in results[lambda0] if x["m"] == m), None)
+    if md is None:
+        print(f"Mode m={m} not found at lambda={lambda0}")
+        return
+    plt.figure()
+    plt.plot(md["x"], md["field"])
+    plt.xlabel("x")
+    plt.ylabel("E_y (normalized)")
+    plt.grid(True)
+    plt.title(f"Field profile: λ={lambda0:.6g}, TE m={m}")
+    plt.show()
+
+def print_summary(results, lambda_list, ms=(0,1)):
+    for lam in lambda_list:
+        line = [f"λ={lam:.6g}"]
+        for m in ms:
+            md = next((x for x in results[lam] if x["m"] == m), None)
+            if md is None:
+                line.append(f"m={m}: ---")
+            else:
+                neff = md.get("neff", np.nan)
+                ng   = md.get("ng", np.nan)
+                line.append(f"m={m}: neff={neff:.6f}, ng={ng:.6f}")
+        print(" | ".join(line))
+
+# ---------------------------
+# MAIN
+# ---------------------------
+if __name__ == "__main__":
+    n_core = float(input("Введите n_core: "))
+    n_clad = float(input("Введите n_clad: "))
+    h      = float(input("Введите thickness h (в тех же единицах, что и λ): "))
+
+    lam_min = float(input("Введите lambda_min: "))
+    lam_max = float(input("Введите lambda_max: "))
+    Nlam    = int(input("Введите число точек по λ (>=3): "))
+
+    lambda_list = np.linspace(lam_min, lam_max, Nlam)
+
+    results  = sweep_lambda_TE(n_core, n_clad, h, lambda_list, m_max=6)
+    branches = extract_branches(results, lambda_list)
+
+    plot_neff_ng(branches)
+
+    target = float(input("Для поля: введите lambda0 (например 1.55): "))
+    lam0 = nearest_lambda(lambda_list, target)
+    plot_field_at_lambda(results, lam0, m=0)
+
+    print_summary(results, lambda_list, ms=(0,1))
